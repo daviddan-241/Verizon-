@@ -19,11 +19,13 @@ async def scan_pumpfun(session: aiohttp.ClientSession) -> List[TokenInfo]:
     tokens = []
     seen = set()
 
-    # Try multiple endpoints
     urls = [
         ("https://frontend-api-v2.pump.fun/coins/latest", {}),
-        ("https://frontend-api-v2.pump.fun/coins", {"limit": "50", "offset": "0", "sort": "created_timestamp", "order": "DESC", "includeNsfw": "false"}),
-        ("https://frontend-api-v2.pump.fun/coins/currently-live", {"limit": "50", "offset": "0"}),
+        ("https://frontend-api-v2.pump.fun/coins", {
+            "limit": "50", "offset": "0",
+            "sort": "created_timestamp", "order": "DESC",
+            "includeNsfw": "false",
+        }),
     ]
 
     for url, params in urls:
@@ -46,7 +48,6 @@ async def scan_pumpfun(session: aiohttp.ClientSession) -> List[TokenInfo]:
 
 
 def _parse_coin(coin: dict) -> TokenInfo | None:
-    """Parse a Pump.fun coin and check for TG link."""
     try:
         name = coin.get("name", "Unknown")
         symbol = coin.get("symbol", "?")
@@ -55,13 +56,13 @@ def _parse_coin(coin: dict) -> TokenInfo | None:
         website = coin.get("website", "")
         telegram = coin.get("telegram", "")
         twitter = coin.get("twitter", "")
+        image_uri = coin.get("image_uri", "") or coin.get("uri", "")
 
         if not mint:
             return None
 
         tg_link = None
 
-        # Check telegram field
         if telegram:
             if telegram.startswith("http"):
                 tg_link = telegram
@@ -72,13 +73,11 @@ def _parse_coin(coin: dict) -> TokenInfo | None:
             else:
                 tg_link = f"https://t.me/{telegram}"
 
-        # Check description
         if not tg_link and description:
             found = extract_telegram_links(description)
             if found:
                 tg_link = found[0]
 
-        # Check website field for tg links
         if not tg_link and website:
             found = extract_telegram_links(website)
             if found:
@@ -96,6 +95,7 @@ def _parse_coin(coin: dict) -> TokenInfo | None:
             source="Pump.fun",
             website=website or None,
             twitter=twitter or None,
+            image_url=image_uri or None,
             pair_url=f"https://pump.fun/{mint}",
         )
     except Exception as e:

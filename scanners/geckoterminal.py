@@ -1,33 +1,20 @@
 """
-GeckoTerminal Scanner - Scans new pools across all major networks.
+GeckoTerminal Scanner - Scans new pools on top chains only (avoid rate limits).
 """
 import logging
 import asyncio
 import aiohttp
 from typing import List
-from .base import TokenInfo, find_tg_in_socials, extract_telegram_links
+from .base import TokenInfo, extract_telegram_links
 
 logger = logging.getLogger(__name__)
 
+# Only scan top 4 chains to avoid rate limits (free API = 30 req/min)
 NETWORKS = [
     ("solana", "Solana"),
     ("eth", "Ethereum"),
     ("bsc", "BSC"),
     ("base", "Base"),
-    ("arbitrum", "Arbitrum"),
-    ("ton", "TON"),
-    ("polygon_pos", "Polygon"),
-    ("avax", "Avalanche"),
-    ("optimism", "Optimism"),
-    ("fantom", "Fantom"),
-    ("blast", "Blast"),
-    ("linea", "Linea"),
-    ("scroll", "Scroll"),
-    ("sui-network", "Sui"),
-    ("tron", "Tron"),
-    ("celo", "Celo"),
-    ("mantle", "Mantle"),
-    ("zksync", "zkSync"),
 ]
 
 HEADERS = {"Accept": "application/json"}
@@ -38,9 +25,8 @@ async def scan_geckoterminal(session: aiohttp.ClientSession) -> List[TokenInfo]:
     tokens = []
     seen = set()
 
-    # Scan each network for new pools
     for net_id, net_name in NETWORKS:
-        url = f"https://api.geckoterminal.com/api/v2/networks/{net_id}/new_pools"
+        url = f"https://api.geckoterminal.com/api/v2/networks/{net_id}/new_pools?page=1"
         try:
             async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
@@ -52,17 +38,19 @@ async def scan_geckoterminal(session: aiohttp.ClientSession) -> List[TokenInfo]:
                             seen.add(t.contract_address.lower())
                             tokens.append(t)
                 elif resp.status == 429:
-                    logger.warning("GeckoTerminal rate limited, pausing")
-                    await asyncio.sleep(2)
+                    logger.warning(f"GeckoTerminal rate limited on {net_name}, skipping rest")
+                    break
         except Exception as e:
             logger.debug(f"GeckoTerminal {net_id} error: {e}")
+
+        # Small delay between chain requests
+        await asyncio.sleep(1)
 
     logger.info(f"GeckoTerminal: {len(tokens)} tokens with TG links")
     return tokens
 
 
 async def _process_pool(session, pool: dict, net_id: str, net_name: str) -> TokenInfo | None:
-    """Process a pool - extract token info and check for TG."""
     try:
         attrs = pool.get("attributes", {})
         relationships = pool.get("relationships", {})
@@ -73,7 +61,6 @@ async def _process_pool(session, pool: dict, net_id: str, net_name: str) -> Toke
 
         pool_address = pool_id.split("_")[1] if "_" in pool_id else ""
 
-        # Get token address
         base_token = relationships.get("base_token", {}).get("data", {})
         token_id = base_token.get("id", "")
         token_address = token_id.split("_")[1] if "_" in token_id else ""
@@ -81,9 +68,7 @@ async def _process_pool(session, pool: dict, net_id: str, net_name: str) -> Toke
         if not token_address:
             return None
 
-        # Try to get socials from token info endpoint
         tg_link = await _get_token_tg(session, net_id, token_address)
-
         if not tg_link:
             return None
 
@@ -102,22 +87,18 @@ async def _process_pool(session, pool: dict, net_id: str, net_name: str) -> Toke
 
 
 async def _get_token_tg(session, network: str, token_address: str) -> str | None:
-    """Fetch token info to find Telegram link."""
     try:
         url = f"https://api.geckoterminal.com/api/v2/networks/{network}/tokens/{token_address}/info"
         async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 attrs = data.get("data", {}).get("attributes", {})
-
-                tg_handle = attrs.get("telegram_handle", "")
-                if tg_handle:
-                    return f"https://t.me/{tg_handle}"
-
-                description = attrs.get("description", "")
-                websites = attrs.get("websites", [])
-                all_text = f"{description} {str(websites)}"
-                links = extract_telegram_links(all_text)
+                tg = attrs.get("telegram_handle", "")
+                if tg:
+                    return f"https://t.me/{tg}"
+                desc = attrs.get("description", "")
+                sites = str(attrs.get("websites", []))
+                links = extract_telegram_links(f"{desc} {sites}")
                 if links:
                     return links[0]
     except:

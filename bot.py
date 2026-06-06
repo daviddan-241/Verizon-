@@ -1,7 +1,7 @@
 """
 Telegram Coin Scanner Bot
-Scans DexScreener, GeckoTerminal, Pump.fun, and trending pools
-for new tokens with Telegram links. Posts to your group every 2s.
+Scans DexScreener, GeckoTerminal, Pump.fun for new tokens with TG links.
+Posts photo + inline buttons to your group.
 """
 import logging
 import asyncio
@@ -12,7 +12,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 import config
 from server import start_health_server
-from formatter import format_token_message
+from formatter import format_caption, build_keyboard
 from scanners.base import TokenInfo
 from scanners.dexscreener import scan_dexscreener
 from scanners.geckoterminal import scan_geckoterminal
@@ -21,11 +21,13 @@ from scanners.birdeye import scan_extra_sources
 
 logger = logging.getLogger(__name__)
 
-# Track posted tokens to avoid duplicates
 seen_tokens: set[str] = set()
 MAX_SEEN = 50000
 scan_count = 0
 total_posted = 0
+
+# Default placeholder image when token has no icon
+DEFAULT_IMAGE = "https://i.ibb.co/4Rz0gJq/coin-placeholder.png"
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -33,7 +35,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🤖 <b>Coin Scanner Bot</b>\n\n"
         f"Your Chat ID: <code>{chat_id}</code>\n\n"
-        "Scanning DexScreener, GeckoTerminal, Pump.fun for new tokens with TG links.\n\n"
+        "Scanning for new tokens with TG links.\n\n"
         "/status - Bot status\n"
         "/scan - Manual scan\n"
         "/stats - Statistics\n"
@@ -63,7 +65,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📈 Scans: {scan_count} | Posted: {total_posted} | Cached: {len(seen_tokens)}",
-        parse_mode=ParseMode.HTML,
     )
 
 
@@ -80,6 +81,55 @@ async def manual_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(f"✅ Done. {count} new tokens found.")
 
 
+async def send_token_message(bot: Bot, token: TokenInfo):
+    """Send a token as photo + caption + inline buttons."""
+    caption = format_caption(token)
+    keyboard = build_keyboard(token)
+
+    image_url = token.image_url or DEFAULT_IMAGE
+
+    try:
+        # Try sending with token image
+        await bot.send_photo(
+            chat_id=config.TELEGRAM_CHAT_ID,
+            photo=image_url,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        return True
+    except Exception as e:
+        logger.debug(f"Photo send failed ({e}), trying fallback...")
+
+    # Fallback: try with default image
+    if image_url != DEFAULT_IMAGE:
+        try:
+            await bot.send_photo(
+                chat_id=config.TELEGRAM_CHAT_ID,
+                photo=DEFAULT_IMAGE,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+            return True
+        except Exception as e2:
+            logger.debug(f"Default image also failed ({e2}), sending text only")
+
+    # Final fallback: text message with buttons
+    try:
+        await bot.send_message(
+            chat_id=config.TELEGRAM_CHAT_ID,
+            text=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+        return True
+    except Exception as e3:
+        logger.error(f"All send methods failed for {token.name}: {e3}")
+        return False
+
+
 async def run_scan_cycle(bot: Bot) -> int:
     """Run one scan cycle across all scanners."""
     global seen_tokens, scan_count, total_posted
@@ -94,7 +144,6 @@ async def run_scan_cycle(bot: Bot) -> int:
             tasks.append(scan_geckoterminal(session))
         if config.ENABLE_PUMPFUN:
             tasks.append(scan_pumpfun(session))
-        # Always run extra sources
         tasks.append(scan_extra_sources(session))
 
         if not tasks:
@@ -118,20 +167,12 @@ async def run_scan_cycle(bot: Bot) -> int:
     # Post to group
     posted = 0
     for token in new_tokens:
-        try:
-            msg = format_token_message(token)
-            await bot.send_message(
-                chat_id=config.TELEGRAM_CHAT_ID,
-                text=msg,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+        success = await send_token_message(bot, token)
+        if success:
             posted += 1
             total_posted += 1
             logger.info(f"Posted: {token.name} (${token.symbol}) [{token.chain}] - {token.telegram_link}")
-            await asyncio.sleep(0.5)  # avoid TG rate limits
-        except Exception as e:
-            logger.error(f"Post error for {token.name}: {e}")
+        await asyncio.sleep(1)  # rate limit safety
 
     # Prune cache
     if len(seen_tokens) > MAX_SEEN:
@@ -143,7 +184,7 @@ async def run_scan_cycle(bot: Bot) -> int:
 
 
 async def periodic_scan(bot: Bot):
-    """Background loop - scans every SCAN_INTERVAL seconds."""
+    """Background loop."""
     logger.info(f"Scanner started (every {config.SCAN_INTERVAL}s)")
     try:
         await bot.send_message(
@@ -181,13 +222,12 @@ def main():
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
     if not config.TELEGRAM_BOT_TOKEN:
-        print("❌ TELEGRAM_BOT_TOKEN not set! Add it to .env or environment variables.")
+        print("❌ TELEGRAM_BOT_TOKEN not set!")
         return
     if not config.TELEGRAM_CHAT_ID:
-        print("❌ TELEGRAM_CHAT_ID not set! Add it to .env or environment variables.")
+        print("❌ TELEGRAM_CHAT_ID not set!")
         return
 
-    # Start HTTP server for Render free web service
     start_health_server()
 
     print("🚀 Starting Coin Scanner Bot...")
