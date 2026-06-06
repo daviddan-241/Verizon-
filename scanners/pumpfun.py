@@ -18,7 +18,7 @@ HEADERS = {
 }
 
 # Only post coins younger than this (minutes)
-MAX_AGE_MIN = 30
+MAX_AGE_MIN = 60
 
 # Skip known spam bot TG links
 SPAM_TG = {"masslauncherbot", "masslaunchbot", "masslauncher"}

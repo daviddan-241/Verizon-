@@ -1,7 +1,7 @@
 """
-DexScreener Scanner - All chains, FRESH coins only.
-Fetches profiles/boosts, batch lookups pair info, filters by age.
-Only posts coins created within the last MAX_AGE_MIN.
+DexScreener Scanner — All chains.
+Wider age filter: 60min for Solana, 180min for other chains.
+Also searches for fresh pairs across chains.
 """
 import logging
 import time
@@ -17,17 +17,27 @@ ENDPOINTS = [
     "https://api.dexscreener.com/token-boosts/top/v1",
 ]
 
+# Fresh pair searches — catches tokens not in profiles/boosts
+SEARCH_QUERIES = [
+    "telegram base",
+    "telegram ethereum",
+    "telegram bsc",
+    "telegram arbitrum",
+    "telegram solana",
+]
+
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
-# Only post coins younger than this (minutes)
-MAX_AGE_MIN = 60
+MAX_AGE_SOL = 60       # 1 hour for Solana (pump.fun covers it too)
+MAX_AGE_OTHER = 180    # 3 hours for non-Solana chains
 
 
 async def scan_dexscreener(session: aiohttp.ClientSession) -> List[TokenInfo]:
-    """Scan DexScreener - only fresh tokens with TG."""
+    """Scan DexScreener — profiles, boosts, top, + search for multi-chain."""
 
-    # Step 1: Collect token addresses
     addr_chain: dict[str, str] = {}
+
+    # 1) Profiles + Boosts + Top
     for url in ENDPOINTS:
         try:
             async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
@@ -42,7 +52,24 @@ async def scan_dexscreener(session: aiohttp.ClientSession) -> List[TokenInfo]:
         except Exception as e:
             logger.error(f"DexScreener error: {e}")
 
-    # Step 2: Group by chain, batch lookup
+    # 2) Search queries — finds fresh pairs across all chains
+    for query in SEARCH_QUERIES:
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
+            async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    for pair in pairs:
+                        base = pair.get("baseToken", {})
+                        addr = base.get("address", "")
+                        chain = pair.get("chainId", "")
+                        if addr and chain:
+                            addr_chain.setdefault(addr, chain)
+        except:
+            pass
+
+    # 3) Group by chain, batch lookup
     by_chain: dict[str, list[str]] = {}
     for addr, chain in addr_chain.items():
         by_chain.setdefault(chain, []).append(addr)
@@ -52,6 +79,8 @@ async def scan_dexscreener(session: aiohttp.ClientSession) -> List[TokenInfo]:
     now_ms = time.time() * 1000
 
     for chain_id, addrs in by_chain.items():
+        max_age = MAX_AGE_SOL if chain_id == "solana" else MAX_AGE_OTHER
+
         for i in range(0, len(addrs), 30):
             batch = addrs[i:i + 30]
             url = f"https://api.dexscreener.com/tokens/v1/{chain_id}/{','.join(batch)}"
@@ -61,18 +90,18 @@ async def scan_dexscreener(session: aiohttp.ClientSession) -> List[TokenInfo]:
                         pairs = await resp.json()
                         if isinstance(pairs, list):
                             for pair in pairs:
-                                t = _parse_pair(pair, chain_id, now_ms)
+                                t = _parse_pair(pair, chain_id, now_ms, max_age)
                                 if t and t.contract_address.lower() not in seen:
                                     seen.add(t.contract_address.lower())
                                     tokens.append(t)
             except Exception as e:
                 logger.debug(f"DexScreener batch error ({chain_id}): {e}")
 
-    logger.info(f"DexScreener: {len(tokens)} fresh tokens with TG (under {MAX_AGE_MIN}min)")
+    logger.info(f"DexScreener: {len(tokens)} fresh tokens with TG")
     return tokens
 
 
-def _parse_pair(pair: dict, chain_id: str, now_ms: float) -> TokenInfo | None:
+def _parse_pair(pair: dict, chain_id: str, now_ms: float, max_age: int) -> TokenInfo | None:
     try:
         base = pair.get("baseToken", {})
         info = pair.get("info", {})
@@ -83,14 +112,13 @@ def _parse_pair(pair: dict, chain_id: str, now_ms: float) -> TokenInfo | None:
         if not address or not name:
             return None
 
-        # --- AGE CHECK: Skip old coins ---
+        # Age check
         created = pair.get("pairCreatedAt", 0)
         if created:
             age_min = (now_ms - created) / 60000
-            if age_min > MAX_AGE_MIN:
+            if age_min > max_age:
                 return None
 
-        # --- Get TG from socials ---
         socials = info.get("socials", [])
         image_url = info.get("imageUrl", "")
         websites = info.get("websites", [])
@@ -125,13 +153,7 @@ def _parse_pair(pair: dict, chain_id: str, now_ms: float) -> TokenInfo | None:
         if not tg.startswith("http"):
             tg = f"https://t.me/{tg}"
 
-        names = {
-            "solana": "Solana", "ethereum": "Ethereum", "bsc": "BSC", "base": "Base",
-            "arbitrum": "Arbitrum", "polygon": "Polygon", "avalanche": "Avalanche",
-            "optimism": "Optimism", "blast": "Blast", "sui": "Sui", "ton": "TON",
-            "tron": "Tron", "linea": "Linea", "cronos": "Cronos",
-        }
-        chain_name = names.get(chain_id.lower(), chain_id.capitalize())
+        chain_name = _chain_name(chain_id)
 
         return TokenInfo(
             name=name, symbol=symbol, contract_address=address,
@@ -142,3 +164,13 @@ def _parse_pair(pair: dict, chain_id: str, now_ms: float) -> TokenInfo | None:
         )
     except:
         return None
+
+
+def _chain_name(chain_id: str) -> str:
+    names = {
+        "solana": "Solana", "ethereum": "Ethereum", "bsc": "BSC", "base": "Base",
+        "arbitrum": "Arbitrum", "polygon": "Polygon", "avalanche": "Avalanche",
+        "optimism": "Optimism", "blast": "Blast", "sui": "Sui", "ton": "TON",
+        "tron": "Tron", "linea": "Linea", "cronos": "Cronos",
+    }
+    return names.get(chain_id.lower(), chain_id.capitalize())

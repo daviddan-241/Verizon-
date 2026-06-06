@@ -1,6 +1,7 @@
 """
-GeckoTerminal Scanner - Fresh ETH/Base/BSC new pairs only.
-Age-filtered: only tokens under MAX_AGE_MIN minutes.
+GeckoTerminal Scanner — Multi-chain new pools.
+Wider coverage: 6 chains, 2 pages each, 3-hour age window.
+Uses DexScreener for token enrichment (socials, image).
 """
 import logging
 import time
@@ -15,36 +16,44 @@ NETWORKS = [
     ("eth", "ethereum", "Ethereum"),
     ("base", "base", "Base"),
     ("bsc", "bsc", "BSC"),
+    ("arbitrum", "arbitrum", "Arbitrum"),
+    ("polygon_pos", "polygon", "Polygon"),
+    ("solana", "solana", "Solana"),
 ]
 
 HEADERS = {"Accept": "application/json"}
-MAX_AGE_MIN = 60
+MAX_AGE_MIN = 180  # 3 hours
 
 
 async def scan_geckoterminal(session: aiohttp.ClientSession) -> List[TokenInfo]:
-    """Fresh non-Solana tokens only."""
+    """Scan GeckoTerminal new pools across 6 chains, enrich via DexScreener."""
     by_chain: dict[str, list[str]] = {}
 
     for gecko_id, dex_id, _ in NETWORKS:
-        url = f"https://api.geckoterminal.com/api/v2/networks/{gecko_id}/new_pools?page=1"
-        try:
-            async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    addrs = []
-                    for pool in data.get("data", []):
-                        tid = pool.get("relationships", {}).get("base_token", {}).get("data", {}).get("id", "")
-                        addr = tid.split("_")[1] if "_" in tid else ""
-                        if addr:
-                            addrs.append(addr)
-                    if addrs:
-                        by_chain[dex_id] = addrs
-                elif resp.status == 429:
-                    break
-        except:
-            pass
-        await asyncio.sleep(2)
+        addrs = []
+        for page in [1, 2]:
+            url = f"https://api.geckoterminal.com/api/v2/networks/{gecko_id}/new_pools?page={page}"
+            try:
+                async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for pool in data.get("data", []):
+                            tid = pool.get("relationships", {}).get("base_token", {}).get("data", {}).get("id", "")
+                            addr = tid.split("_")[1] if "_" in tid else ""
+                            if addr and addr not in addrs:
+                                addrs.append(addr)
+                    elif resp.status == 429:
+                        break
+            except:
+                pass
+            await asyncio.sleep(1.5)
 
+        if addrs:
+            existing = by_chain.get(dex_id, [])
+            existing.extend(a for a in addrs if a not in existing)
+            by_chain[dex_id] = existing
+
+    # Batch lookup on DexScreener
     tokens = []
     seen = set()
     now_ms = time.time() * 1000
@@ -52,19 +61,21 @@ async def scan_geckoterminal(session: aiohttp.ClientSession) -> List[TokenInfo]:
 
     for dex_id, addrs in by_chain.items():
         chain_name = names_map.get(dex_id, dex_id)
-        url = f"https://api.dexscreener.com/tokens/v1/{dex_id}/{','.join(addrs[:30])}"
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
-                if resp.status == 200:
-                    pairs = await resp.json()
-                    if isinstance(pairs, list):
-                        for pair in pairs:
-                            t = _parse(pair, dex_id, chain_name, now_ms)
-                            if t and t.contract_address.lower() not in seen:
-                                seen.add(t.contract_address.lower())
-                                tokens.append(t)
-        except:
-            pass
+        for i in range(0, len(addrs), 30):
+            batch = addrs[i:i + 30]
+            url = f"https://api.dexscreener.com/tokens/v1/{dex_id}/{','.join(batch)}"
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                    if resp.status == 200:
+                        pairs = await resp.json()
+                        if isinstance(pairs, list):
+                            for pair in pairs:
+                                t = _parse(pair, dex_id, chain_name, now_ms)
+                                if t and t.contract_address.lower() not in seen:
+                                    seen.add(t.contract_address.lower())
+                                    tokens.append(t)
+            except:
+                pass
 
     logger.info(f"GeckoTerminal: {len(tokens)} fresh tokens with TG")
     return tokens
@@ -89,6 +100,11 @@ def _parse(pair: dict, chain_id: str, chain_name: str, now_ms: float) -> TokenIn
 
         socials = info.get("socials", [])
         tg = next((s.get("url", "") for s in socials if s.get("type") == "telegram"), "")
+        if not tg:
+            desc = info.get("description", "") or ""
+            found = extract_telegram_links(desc)
+            if found:
+                tg = found[0]
         if not tg:
             return None
         if not tg.startswith("http"):
