@@ -1,7 +1,7 @@
 """
-Pump.fun Scanner (V3 API) - THE main source of fresh coins.
-Scans latest launches + currently-live for coins with Telegram links.
-~40 coins with TG per hour.
+Pump.fun Scanner (V3 API) - Fresh coins ONLY.
+Only posts coins created within the last MAX_AGE_MIN minutes.
+Validates TG links are real t.me/ links, not scam domains.
 """
 import logging
 import time
@@ -17,58 +17,63 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 }
 
+# Only post coins younger than this (minutes)
+MAX_AGE_MIN = 30
+
 # Skip known spam bot TG links
 SPAM_TG = {"masslauncherbot", "masslaunchbot", "masslauncher"}
 
 
 async def scan_pumpfun(session: aiohttp.ClientSession) -> List[TokenInfo]:
-    """Scan Pump.fun V3 for brand new coins with TG links."""
+    """Scan Pump.fun V3 for BRAND NEW coins with real TG links."""
     tokens = []
     seen = set()
+    now_ms = time.time() * 1000
 
-    # 1) Latest coins (sorted by creation time, newest first) - pages 0-500
-    for offset in range(0, 500, 50):
+    # Scan latest coins (newest first) - stop when coins are too old
+    for offset in range(0, 1000, 50):
         url = f"{BASE}/coins?limit=50&offset={offset}&sort=created_timestamp&order=DESC&includeNsfw=false"
+        too_old = False
         try:
             async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     coins = await resp.json()
-                    if isinstance(coins, list):
-                        for coin in coins:
-                            t = _parse(coin)
-                            if t and t.contract_address.lower() not in seen:
-                                seen.add(t.contract_address.lower())
-                                tokens.append(t)
+                    if not isinstance(coins, list) or not coins:
+                        break
+                    for coin in coins:
+                        created = coin.get("created_timestamp", 0)
+                        # Handle both ms and seconds timestamps
+                        if created < 1e12:
+                            created = created * 1000
+                        age_min = (now_ms - created) / 60000 if created else 99999
+
+                        # Stop scanning if coins are older than MAX_AGE
+                        if age_min > MAX_AGE_MIN:
+                            too_old = True
+                            break
+
+                        t = _parse(coin, age_min)
+                        if t and t.contract_address.lower() not in seen:
+                            seen.add(t.contract_address.lower())
+                            tokens.append(t)
                 else:
                     break
         except Exception as e:
             logger.debug(f"Pump.fun page {offset} error: {e}")
             break
 
-    # 2) Currently live (graduated from bonding curve)
-    try:
-        url = f"{BASE}/coins/currently-live?limit=50&offset=0"
-        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 200:
-                coins = await resp.json()
-                if isinstance(coins, list):
-                    for coin in coins:
-                        t = _parse(coin)
-                        if t and t.contract_address.lower() not in seen:
-                            seen.add(t.contract_address.lower())
-                            tokens.append(t)
-    except Exception as e:
-        logger.debug(f"Pump.fun currently-live error: {e}")
+        if too_old:
+            break
 
-    logger.info(f"Pump.fun: {len(tokens)} fresh tokens with TG links")
+    logger.info(f"Pump.fun: {len(tokens)} fresh tokens with TG (under {MAX_AGE_MIN}min)")
     return tokens
 
 
-def _parse(coin: dict) -> TokenInfo | None:
-    """Parse a pump.fun coin and validate TG link."""
+def _parse(coin: dict, age_min: float) -> TokenInfo | None:
+    """Parse a pump.fun coin - strict TG validation."""
     try:
-        name = coin.get("name", "").strip()
-        symbol = coin.get("symbol", "").strip()
+        name = (coin.get("name", "") or "").strip()
+        symbol = (coin.get("symbol", "") or "").strip()
         mint = coin.get("mint", "")
         tg_raw = (coin.get("telegram", "") or "").strip()
         website = (coin.get("website", "") or "").strip()
@@ -79,10 +84,10 @@ def _parse(coin: dict) -> TokenInfo | None:
         if not mint or not name:
             return None
 
-        # --- Find and validate TG link ---
-        tg_link = _clean_tg(tg_raw)
+        # --- Strict TG validation ---
+        tg_link = _validate_tg(tg_raw)
 
-        # Also check description for TG links
+        # Also check description
         if not tg_link and description:
             found = extract_telegram_links(description)
             if found:
@@ -91,21 +96,18 @@ def _parse(coin: dict) -> TokenInfo | None:
         if not tg_link:
             return None
 
-        # Filter spam bots
-        tg_handle = tg_link.split("t.me/")[-1].lower() if "t.me/" in tg_link else ""
+        # Filter spam TG handles
+        tg_handle = tg_link.split("t.me/")[-1].lower().strip("/") if "t.me/" in tg_link else ""
         if tg_handle in SPAM_TG:
             return None
 
-        # Filter TG links that are actually Twitter/X links
-        if "x.com" in tg_link or "twitter.com" in tg_link:
-            return None
+        # Clean website - skip if it's just a social link
+        if website:
+            if any(x in website for x in ["t.me/", "x.com/", "twitter.com/", "discord.gg/"]):
+                website = ""
 
-        # Clean up website - skip if it's a TG/X link
-        if website and ("t.me/" in website or "x.com/" in website or "twitter.com/" in website):
-            website = ""
-
-        # If twitter field is actually a TG link, skip it
-        if twitter and ("t.me/" in twitter):
+        # Clean twitter
+        if twitter and "t.me/" in twitter:
             twitter = ""
 
         return TokenInfo(
@@ -125,29 +127,45 @@ def _parse(coin: dict) -> TokenInfo | None:
         return None
 
 
-def _clean_tg(raw: str) -> str | None:
-    """Clean and validate a Telegram link."""
+def _validate_tg(raw: str) -> str | None:
+    """
+    Strictly validate that the TG field is a REAL t.me/ link.
+    Reject scam domains, twitter links, random URLs.
+    """
     if not raw:
         return None
 
     raw = raw.strip()
 
-    # Skip non-TG links
+    # REJECT anything that is NOT a telegram link
+    # Scammers put random domains like "mistik.best" or "bunox.top" in TG field
     if "x.com" in raw or "twitter.com" in raw or "discord" in raw:
         return None
 
-    # Already a full URL
+    # Must contain t.me/ to be valid
     if raw.startswith("https://t.me/") or raw.startswith("http://t.me/"):
-        return raw
+        handle = raw.split("t.me/")[1].strip("/")
+        if handle and len(handle) >= 2:
+            return raw
+        return None
+
     if raw.startswith("t.me/"):
-        return f"https://{raw}"
-    if raw.startswith("@"):
+        handle = raw[5:].strip("/")
+        if handle and len(handle) >= 2:
+            return f"https://{raw}"
+        return None
+
+    # @handle format
+    if raw.startswith("@") and len(raw) > 2 and "." not in raw:
         return f"https://t.me/{raw[1:]}"
 
-    # Plain handle
-    if raw and "/" not in raw and "." not in raw and " " not in raw:
+    # Plain handle (no dots, no slashes, no spaces = likely a TG handle)
+    if raw and "/" not in raw and " " not in raw and len(raw) >= 3:
+        # BUT reject if it has a dot (likely a domain, not a TG handle)
+        if "." in raw:
+            return None
         return f"https://t.me/{raw}"
 
-    # Try extracting from the string
+    # Try extracting from string
     found = extract_telegram_links(raw)
     return found[0] if found else None

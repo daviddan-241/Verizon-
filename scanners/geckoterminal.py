@@ -1,8 +1,9 @@
 """
-GeckoTerminal Scanner - New pools across top chains.
-Gets fresh token addresses, then enriches via DexScreener for socials.
+GeckoTerminal Scanner - Fresh ETH/Base/BSC new pairs only.
+Age-filtered: only tokens under MAX_AGE_MIN minutes.
 """
 import logging
+import time
 import asyncio
 import aiohttp
 from typing import List
@@ -15,13 +16,13 @@ NETWORKS = [
     ("base", "base", "Base"),
     ("bsc", "bsc", "BSC"),
 ]
-# Note: Solana skipped here since Pump.fun covers it better
 
 HEADERS = {"Accept": "application/json"}
+MAX_AGE_MIN = 60
 
 
 async def scan_geckoterminal(session: aiohttp.ClientSession) -> List[TokenInfo]:
-    """Get fresh non-Solana token addresses, enrich via DexScreener."""
+    """Fresh non-Solana tokens only."""
     by_chain: dict[str, list[str]] = {}
 
     for gecko_id, dex_id, _ in NETWORKS:
@@ -44,9 +45,9 @@ async def scan_geckoterminal(session: aiohttp.ClientSession) -> List[TokenInfo]:
             pass
         await asyncio.sleep(2)
 
-    # Batch lookup on DexScreener
     tokens = []
     seen = set()
+    now_ms = time.time() * 1000
     names_map = {d: n for _, d, n in NETWORKS}
 
     for dex_id, addrs in by_chain.items():
@@ -58,18 +59,18 @@ async def scan_geckoterminal(session: aiohttp.ClientSession) -> List[TokenInfo]:
                     pairs = await resp.json()
                     if isinstance(pairs, list):
                         for pair in pairs:
-                            t = _parse(pair, dex_id, chain_name)
+                            t = _parse(pair, dex_id, chain_name, now_ms)
                             if t and t.contract_address.lower() not in seen:
                                 seen.add(t.contract_address.lower())
                                 tokens.append(t)
         except:
             pass
 
-    logger.info(f"GeckoTerminal: {len(tokens)} tokens with TG links")
+    logger.info(f"GeckoTerminal: {len(tokens)} fresh tokens with TG")
     return tokens
 
 
-def _parse(pair: dict, chain_id: str, chain_name: str) -> TokenInfo | None:
+def _parse(pair: dict, chain_id: str, chain_name: str, now_ms: float) -> TokenInfo | None:
     try:
         base = pair.get("baseToken", {})
         info = pair.get("info", {})
@@ -78,6 +79,13 @@ def _parse(pair: dict, chain_id: str, chain_name: str) -> TokenInfo | None:
         address = base.get("address", "")
         if not address or not name:
             return None
+
+        # Age check
+        created = pair.get("pairCreatedAt", 0)
+        if created:
+            age_min = (now_ms - created) / 60000
+            if age_min > MAX_AGE_MIN:
+                return None
 
         socials = info.get("socials", [])
         tg = next((s.get("url", "") for s in socials if s.get("type") == "telegram"), "")

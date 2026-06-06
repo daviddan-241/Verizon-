@@ -1,10 +1,10 @@
 """
-DexScreener Scanner
-Fetches latest profiles/boosts, then batch-looks up REAL pair info
-to get name, symbol, image, and TG from pair socials.
-Covers all chains (ETH, Base, BSC, Arbitrum, etc).
+DexScreener Scanner - All chains, FRESH coins only.
+Fetches profiles/boosts, batch lookups pair info, filters by age.
+Only posts coins created within the last MAX_AGE_MIN.
 """
 import logging
+import time
 import aiohttp
 from typing import List
 from .base import TokenInfo, extract_telegram_links
@@ -19,11 +19,14 @@ ENDPOINTS = [
 
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
+# Only post coins younger than this (minutes)
+MAX_AGE_MIN = 60
+
 
 async def scan_dexscreener(session: aiohttp.ClientSession) -> List[TokenInfo]:
-    """Scan DexScreener for tokens with TG in pair socials."""
+    """Scan DexScreener - only fresh tokens with TG."""
 
-    # Step 1: Collect all token addresses
+    # Step 1: Collect token addresses
     addr_chain: dict[str, str] = {}
     for url in ENDPOINTS:
         try:
@@ -46,6 +49,7 @@ async def scan_dexscreener(session: aiohttp.ClientSession) -> List[TokenInfo]:
 
     tokens: list[TokenInfo] = []
     seen = set()
+    now_ms = time.time() * 1000
 
     for chain_id, addrs in by_chain.items():
         for i in range(0, len(addrs), 30):
@@ -57,18 +61,18 @@ async def scan_dexscreener(session: aiohttp.ClientSession) -> List[TokenInfo]:
                         pairs = await resp.json()
                         if isinstance(pairs, list):
                             for pair in pairs:
-                                t = _parse_pair(pair, chain_id)
+                                t = _parse_pair(pair, chain_id, now_ms)
                                 if t and t.contract_address.lower() not in seen:
                                     seen.add(t.contract_address.lower())
                                     tokens.append(t)
             except Exception as e:
                 logger.debug(f"DexScreener batch error ({chain_id}): {e}")
 
-    logger.info(f"DexScreener: {len(tokens)} tokens with TG links")
+    logger.info(f"DexScreener: {len(tokens)} fresh tokens with TG (under {MAX_AGE_MIN}min)")
     return tokens
 
 
-def _parse_pair(pair: dict, chain_id: str) -> TokenInfo | None:
+def _parse_pair(pair: dict, chain_id: str, now_ms: float) -> TokenInfo | None:
     try:
         base = pair.get("baseToken", {})
         info = pair.get("info", {})
@@ -79,6 +83,14 @@ def _parse_pair(pair: dict, chain_id: str) -> TokenInfo | None:
         if not address or not name:
             return None
 
+        # --- AGE CHECK: Skip old coins ---
+        created = pair.get("pairCreatedAt", 0)
+        if created:
+            age_min = (now_ms - created) / 60000
+            if age_min > MAX_AGE_MIN:
+                return None
+
+        # --- Get TG from socials ---
         socials = info.get("socials", [])
         image_url = info.get("imageUrl", "")
         websites = info.get("websites", [])
