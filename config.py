@@ -8,7 +8,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Scanning
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "2"))
 
 # Scanners
 ENABLE_DEXSCREENER = os.getenv("ENABLE_DEXSCREENER", "true").lower() == "true"

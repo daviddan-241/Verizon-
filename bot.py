@@ -1,5 +1,7 @@
 """
-Main Telegram Bot - Handles commands and token posting.
+Telegram Coin Scanner Bot
+Scans DexScreener, GeckoTerminal, Pump.fun, and trending pools
+for new tokens with Telegram links. Posts to your group every 2s.
 """
 import logging
 import asyncio
@@ -14,94 +16,71 @@ from scanners.base import TokenInfo
 from scanners.dexscreener import scan_dexscreener
 from scanners.geckoterminal import scan_geckoterminal
 from scanners.pumpfun import scan_pumpfun
+from scanners.birdeye import scan_extra_sources
 
 logger = logging.getLogger(__name__)
 
-# Track already-posted tokens to avoid duplicates
+# Track posted tokens to avoid duplicates
 seen_tokens: set[str] = set()
-
-# Max seen tokens to keep in memory (prevent memory leak)
-MAX_SEEN = 10000
+MAX_SEEN = 50000
+scan_count = 0
+total_posted = 0
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
     await update.message.reply_text(
         "🤖 <b>Coin Scanner Bot</b>\n\n"
-        "I scan multiple platforms for newly launched tokens that have Telegram groups.\n\n"
-        "<b>Commands:</b>\n"
-        "/start - Show this message\n"
-        "/status - Show bot status\n"
-        "/scan - Trigger a manual scan now\n"
-        "/stats - Show scanning statistics\n"
-        "/clear - Clear seen tokens cache\n",
+        "Scanning DexScreener, GeckoTerminal, Pump.fun for new tokens with TG links.\n\n"
+        "/status - Bot status\n"
+        "/scan - Manual scan\n"
+        "/stats - Statistics\n"
+        "/clear - Clear cache",
         parse_mode=ParseMode.HTML,
     )
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /status command."""
     scanners = []
-    if config.ENABLE_DEXSCREENER:
-        scanners.append("✅ DexScreener")
-    else:
-        scanners.append("❌ DexScreener")
-    if config.ENABLE_GECKOTERMINAL:
-        scanners.append("✅ GeckoTerminal")
-    else:
-        scanners.append("❌ GeckoTerminal")
-    if config.ENABLE_PUMPFUN:
-        scanners.append("✅ Pump.fun")
-    else:
-        scanners.append("❌ Pump.fun")
+    if config.ENABLE_DEXSCREENER: scanners.append("✅ DexScreener")
+    if config.ENABLE_GECKOTERMINAL: scanners.append("✅ GeckoTerminal")
+    if config.ENABLE_PUMPFUN: scanners.append("✅ Pump.fun")
+    scanners.append("✅ Trending Pools")
 
     await update.message.reply_text(
-        f"📊 <b>Bot Status</b>\n\n"
-        f"⏱ Scan interval: {config.SCAN_INTERVAL}s\n"
-        f"🔢 Tokens seen: {len(seen_tokens)}\n"
-        f"📡 Chat ID: <code>{config.TELEGRAM_CHAT_ID}</code>\n\n"
-        f"<b>Scanners:</b>\n" + "\n".join(scanners),
+        f"📊 <b>Status</b>\n\n"
+        f"Interval: {config.SCAN_INTERVAL}s\n"
+        f"Tokens cached: {len(seen_tokens)}\n"
+        f"Scans done: {scan_count}\n"
+        f"Total posted: {total_posted}\n\n"
+        + "\n".join(scanners),
         parse_mode=ParseMode.HTML,
     )
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /stats command."""
     await update.message.reply_text(
-        f"📈 <b>Scan Statistics</b>\n\n"
-        f"🔢 Total unique tokens seen: {len(seen_tokens)}\n"
-        f"💾 Cache limit: {MAX_SEEN}",
+        f"📈 Scans: {scan_count} | Posted: {total_posted} | Cached: {len(seen_tokens)}",
         parse_mode=ParseMode.HTML,
     )
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /clear command."""
     global seen_tokens
-    count = len(seen_tokens)
+    c = len(seen_tokens)
     seen_tokens.clear()
-    await update.message.reply_text(
-        f"🧹 Cleared {count} tokens from cache.",
-        parse_mode=ParseMode.HTML,
-    )
+    await update.message.reply_text(f"🧹 Cleared {c} tokens from cache.")
 
 
 async def manual_scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /scan command - trigger manual scan."""
-    await update.message.reply_text("🔍 Running manual scan...")
+    await update.message.reply_text("🔍 Scanning...")
     count = await run_scan_cycle(context.bot)
-    await update.message.reply_text(
-        f"✅ Manual scan complete. Found {count} new tokens with TG links.",
-        parse_mode=ParseMode.HTML,
-    )
+    await update.message.reply_text(f"✅ Done. {count} new tokens found.")
 
 
 async def run_scan_cycle(bot: Bot) -> int:
-    """
-    Run one full scan cycle across all enabled scanners.
-    Returns the number of new tokens found and posted.
-    """
-    global seen_tokens
+    """Run one scan cycle across all scanners."""
+    global seen_tokens, scan_count, total_posted
+    scan_count += 1
     all_tokens: list[TokenInfo] = []
 
     async with aiohttp.ClientSession() as session:
@@ -112,20 +91,20 @@ async def run_scan_cycle(bot: Bot) -> int:
             tasks.append(scan_geckoterminal(session))
         if config.ENABLE_PUMPFUN:
             tasks.append(scan_pumpfun(session))
+        # Always run extra sources
+        tasks.append(scan_extra_sources(session))
 
         if not tasks:
-            logger.warning("No scanners enabled!")
             return 0
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
         for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"Scanner error: {result}")
-            elif isinstance(result, list):
+            if isinstance(result, list):
                 all_tokens.extend(result)
+            elif isinstance(result, Exception):
+                logger.error(f"Scanner error: {result}")
 
-    # Filter out already-seen tokens and deduplicate
+    # Deduplicate
     new_tokens = []
     for token in all_tokens:
         key = token.unique_key
@@ -133,27 +112,26 @@ async def run_scan_cycle(bot: Bot) -> int:
             seen_tokens.add(key)
             new_tokens.append(token)
 
-    # Post new tokens to the group
+    # Post to group
     posted = 0
     for token in new_tokens:
         try:
-            message = format_token_message(token)
+            msg = format_token_message(token)
             await bot.send_message(
                 chat_id=config.TELEGRAM_CHAT_ID,
-                text=message,
+                text=msg,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
             posted += 1
-            logger.info(f"Posted: {token.name} ({token.symbol}) on {token.chain} - {token.telegram_link}")
-            # Small delay between messages to avoid rate limits
-            await asyncio.sleep(1)
+            total_posted += 1
+            logger.info(f"Posted: {token.name} (${token.symbol}) [{token.chain}] - {token.telegram_link}")
+            await asyncio.sleep(0.5)  # avoid TG rate limits
         except Exception as e:
-            logger.error(f"Failed to post token {token.name}: {e}")
+            logger.error(f"Post error for {token.name}: {e}")
 
-    # Prune seen tokens if too large
+    # Prune cache
     if len(seen_tokens) > MAX_SEEN:
-        # Keep the most recent half
         excess = len(seen_tokens) - (MAX_SEEN // 2)
         for _ in range(excess):
             seen_tokens.pop()
@@ -162,77 +140,60 @@ async def run_scan_cycle(bot: Bot) -> int:
 
 
 async def periodic_scan(bot: Bot):
-    """Background task that runs scans periodically."""
-    logger.info(f"Starting periodic scanner (interval: {config.SCAN_INTERVAL}s)")
-
-    # Initial startup message
+    """Background loop - scans every SCAN_INTERVAL seconds."""
+    logger.info(f"Scanner started (every {config.SCAN_INTERVAL}s)")
     try:
         await bot.send_message(
             chat_id=config.TELEGRAM_CHAT_ID,
-            text="🤖 <b>Coin Scanner Bot Started!</b>\n\n"
-                 f"⏱ Scanning every {config.SCAN_INTERVAL} seconds\n"
-                 f"📡 Sources: DexScreener, GeckoTerminal, Pump.fun\n"
-                 f"🔗 Looking for tokens with Telegram links...",
+            text="🤖 <b>Coin Scanner Started</b>\n\n"
+                 f"⏱ Scanning every {config.SCAN_INTERVAL}s\n"
+                 f"📡 DexScreener + GeckoTerminal + Pump.fun\n"
+                 f"🔗 Finding tokens with Telegram links...",
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        logger.error(f"Failed to send startup message: {e}")
+        logger.error(f"Startup msg error: {e}")
 
     while True:
         try:
             count = await run_scan_cycle(bot)
             if count > 0:
-                logger.info(f"Scan cycle complete: {count} new tokens posted")
-            else:
-                logger.debug("Scan cycle complete: no new tokens")
+                logger.info(f"Cycle #{scan_count}: posted {count} new tokens")
         except Exception as e:
             logger.error(f"Scan cycle error: {e}")
-
         await asyncio.sleep(config.SCAN_INTERVAL)
 
 
 async def post_init(application: Application):
-    """Called after the bot is initialized - starts the background scanner."""
     asyncio.create_task(periodic_scan(application.bot))
 
 
 def main():
-    """Main entry point."""
-    # Setup logging
     logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         level=getattr(logging, config.LOG_LEVEL, logging.INFO),
     )
-
-    # Reduce noise from httpx/httpcore
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
     if not config.TELEGRAM_BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN not set! Check your .env file.")
+        print("❌ TELEGRAM_BOT_TOKEN not set! Add it to .env or environment variables.")
         return
-
     if not config.TELEGRAM_CHAT_ID:
-        logger.error("TELEGRAM_CHAT_ID not set! Check your .env file.")
+        print("❌ TELEGRAM_CHAT_ID not set! Add it to .env or environment variables.")
         return
 
-    logger.info("Starting Coin Scanner Bot...")
-
-    # Build the bot application
+    print("🚀 Starting Coin Scanner Bot...")
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 
-    # Add command handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("scan", manual_scan_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("clear", clear_command))
 
-    # Start background scanner after bot init
     app.post_init = post_init
-
-    # Run the bot
-    logger.info("Bot is running! Press Ctrl+C to stop.")
     app.run_polling(drop_pending_updates=True)
 
 
