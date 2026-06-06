@@ -1,7 +1,6 @@
 """
 Telegram Coin Scanner Bot
-Scans Pump.fun + DexScreener + GeckoTerminal for FRESH coins with TG links.
-Posts photo + inline buttons. Persistent dedup survives restarts.
+Fresh coins only. No repeats. Photo + inline buttons.
 """
 import logging
 import asyncio
@@ -31,24 +30,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🤖 <b>Coin Scanner Bot</b>\n\n"
         f"Chat ID: <code>{cid}</code>\n\n"
-        "/status - Bot status\n"
-        "/scan - Manual scan\n"
-        "/stats - Statistics\n"
-        "/clear - Clear cache",
+        "/status /scan /stats /clear",
         parse_mode=ParseMode.HTML,
     )
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = [f"📊 <b>Status</b>\n"]
-    lines.append(f"Interval: {config.SCAN_INTERVAL}s")
-    lines.append(f"Cached: {seen_db.seen_count()}")
-    lines.append(f"Scans: {scan_count}")
-    lines.append(f"Posted: {total_posted}")
-    if config.ENABLE_PUMPFUN: lines.append("✅ Pump.fun")
-    if config.ENABLE_DEXSCREENER: lines.append("✅ DexScreener")
-    if config.ENABLE_GECKOTERMINAL: lines.append("✅ GeckoTerminal")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        f"📊 Interval: {config.SCAN_INTERVAL}s | Cached: {seen_db.seen_count()} | "
+        f"Scans: {scan_count} | Posted: {total_posted}",
+    )
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -72,21 +63,20 @@ async def send_token(bot: Bot, token: TokenInfo) -> bool:
     """Send token as photo + caption + inline buttons."""
     caption = format_caption(token)
     keyboard = build_keyboard(token)
-    image = token.image_url
 
-    # Try photo with token image
-    if image:
+    # Try photo
+    if token.image_url:
         try:
             await bot.send_photo(
                 chat_id=config.TELEGRAM_CHAT_ID,
-                photo=image, caption=caption,
+                photo=token.image_url, caption=caption,
                 parse_mode=ParseMode.HTML, reply_markup=keyboard,
             )
             return True
         except:
             pass
 
-    # Fallback: text + buttons
+    # Fallback: text
     try:
         await bot.send_message(
             chat_id=config.TELEGRAM_CHAT_ID,
@@ -100,7 +90,6 @@ async def send_token(bot: Bot, token: TokenInfo) -> bool:
 
 
 async def run_scan_cycle(bot: Bot) -> int:
-    """Run one scan cycle. Returns number of new tokens posted."""
     global scan_count, total_posted
     scan_count += 1
 
@@ -123,36 +112,34 @@ async def run_scan_cycle(bot: Bot) -> int:
             elif isinstance(r, Exception):
                 logger.error(f"Scanner error: {r}")
 
-    # Deduplicate by contract address (case-insensitive)
-    # Keep first occurrence (priority: pump.fun > dexscreener > gecko)
+    # Dedup by contract address within this cycle
     unique: dict[str, TokenInfo] = {}
     for token in all_tokens:
         addr = token.contract_address.lower()
         if addr not in unique:
             unique[addr] = token
 
-    # Filter already-posted tokens (by address AND by TG link)
+    # Filter already-posted (by address, TG link, AND name+symbol)
     new_tokens = []
     for addr, token in unique.items():
-        if not seen_db.is_seen(addr, token.telegram_link):
+        if not seen_db.is_seen(addr, token.telegram_link, token.name, token.symbol):
             new_tokens.append(token)
 
-    # Post new tokens
+    # Post
     posted = 0
     for token in new_tokens:
         ok = await send_token(bot, token)
         if ok:
-            seen_db.mark_seen(token.contract_address, token.telegram_link)
+            seen_db.mark_seen(token.contract_address, token.telegram_link, token.name, token.symbol)
             posted += 1
             total_posted += 1
             logger.info(f"✅ {token.name} (${token.symbol}) [{token.chain}] {token.telegram_link}")
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2)
 
     return posted
 
 
 async def periodic_scan(bot: Bot):
-    """Background scanner loop."""
     logger.info(f"Scanner started — every {config.SCAN_INTERVAL}s")
     try:
         await bot.send_message(
