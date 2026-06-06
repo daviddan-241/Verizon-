@@ -5,9 +5,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# 10s default - 2s causes rate limits on free APIs
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "10"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "15"))
 
 ENABLE_DEXSCREENER = os.getenv("ENABLE_DEXSCREENER", "true").lower() == "true"
 ENABLE_GECKOTERMINAL = os.getenv("ENABLE_GECKOTERMINAL", "true").lower() == "true"
