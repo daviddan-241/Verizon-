@@ -11,6 +11,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 import config
+from server import start_health_server
 from formatter import format_token_message
 from scanners.base import TokenInfo
 from scanners.dexscreener import scan_dexscreener
@@ -28,8 +29,10 @@ total_posted = 0
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     await update.message.reply_text(
-        "🤖 <b>Coin Scanner Bot</b>\n\n"
+        f"🤖 <b>Coin Scanner Bot</b>\n\n"
+        f"Your Chat ID: <code>{chat_id}</code>\n\n"
         "Scanning DexScreener, GeckoTerminal, Pump.fun for new tokens with TG links.\n\n"
         "/status - Bot status\n"
         "/scan - Manual scan\n"
@@ -183,6 +186,9 @@ def main():
     if not config.TELEGRAM_CHAT_ID:
         print("❌ TELEGRAM_CHAT_ID not set! Add it to .env or environment variables.")
         return
+
+    # Start HTTP server for Render free web service
+    start_health_server()
 
     print("🚀 Starting Coin Scanner Bot...")
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()

@@ -78,17 +78,8 @@ async def scan_dexscreener(session: aiohttp.ClientSession) -> List[TokenInfo]:
     except Exception as e:
         logger.error(f"DexScreener profiles error: {e}")
 
-    # 3) For tokens found without TG, try fetching pair data for socials
-    tokens_needing_lookup = []
-    for item_data in _collect_no_tg_items:
-        pass  # handled inline above
-
     logger.info(f"DexScreener: {len(tokens)} tokens with TG links")
     return tokens
-
-
-# Collect addresses from boosts/profiles that had no TG to look up later
-_collect_no_tg_items = []
 
 
 def _parse_item(item: dict, source: str) -> TokenInfo | None:
